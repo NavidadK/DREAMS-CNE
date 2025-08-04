@@ -9,10 +9,12 @@ def train(
     train_loader,
     model,
     log_Z,
-    log_temp,
+    log_alpha,
     criterion,
     optimizer,
     epoch,
+    decoder=False,
+    regularizer=False,
     clip_grad=True,
     print_freq=None,
     force_resample=None,
@@ -22,7 +24,6 @@ def train(
     :param train_loader: DataLoader Returns batches of similar tuples
     :param model: torch.nn.Module Embedding layer (non-parametric) or neural network (parametric)
     :param log_Z: torch.tensor Float containing the logarithm of the learnable Z
-    :param log_temp: torch.tensor Float containing the logarithm of the learnable temperature. If temperature is not learnable, this is None.
     :param criterion: torch.nn.Module Computes the loss
     :param optimizer:  torch.optim.Optimizer
     :param epoch: int Current training epoch
@@ -33,45 +34,70 @@ def train(
     """
     model.train()
     losses = []
+    cne_losses = []
+    reg_losses = []
+    # pcgrad = PCGrad(optimizer)
+
     for idx, (item, neigh) in enumerate(train_loader):
         print_now = print_freq is not None and (idx + 1) % print_freq == 0
         start = time.time()
 
-        images = torch.cat([item, neigh], dim=0)
+        images = torch.cat([item, neigh], dim=0) # images = idx
 
         images = images.to(next(model.parameters()).device)
 
         # compute loss
-        features = model(images)
+        if decoder:
+            x, x_hat, features = model(images)
+        else:
+            features = model(images)
         if print_now:
             features.retain_grad()  # to print model agnostic grad statistics
         force_resample = force_resample if force_resample is not None else idx == 0
-        loss = criterion(features, log_Z, log_temp, force_resample=force_resample)
+        loss, cne_loss, reg_loss = criterion(features, item, neigh, log_Z, log_alpha, force_resample) # force_resample=force_resample # hier mit regularizer (nur ein criterion/loss) -> item, neigh als zstlz. input
 
         # update metric
         losses.append(loss.item())
-
+        if regularizer or decoder:
+            cne_losses.append(cne_loss.item())
+            reg_losses.append(reg_loss.item())
+        
         # Update parameters
         optimizer.zero_grad()
         loss.backward()
+        if epoch % 20 == 0 and idx == 0:
+            if log_alpha is not None:
+                print(f'alpha: {np.exp(log_alpha.item())} - grad log_alpha {log_alpha.grad.item()}')
         if clip_grad:
             torch.nn.utils.clip_grad_value_(model.parameters(), 4)
             if log_Z is not None:
                 torch.nn.utils.clip_grad_value_(log_Z, 4)
-            if log_temp is not None:
-                torch.nn.utils.clip_grad_value_(log_temp, 4)
+            if log_alpha is not None:
+                torch.nn.utils.clip_grad_value_(log_alpha, 4)
+
         optimizer.step()
 
         # print info
         if print_now:
-            print(
+            if log_alpha is not None:
+                print(
                 f"Train: E{epoch}, {idx}/{len(train_loader)}\t"
                 # print grad on features to be model agnostic
                 f"grad magn {features.grad.abs().sum():.3f}, "
                 f"loss {sum(losses) / len(losses):.3f}, "
                 f"time/iteration {time.time() - start:.3f}",
+                f'log_alpha: {log_alpha.item()}',
                 file=sys.stderr,
             )
+            else:
+                print(
+                    f"Train: E{epoch}, {idx}/{len(train_loader)}\t"
+                    # print grad on features to be model agnostic
+                    f"grad magn {features.grad.abs().sum():.3f}, "
+                    f"loss {sum(losses) / len(losses):.3f}, "
+                    f"time/iteration {time.time() - start:.3f}",
+                    file=sys.stderr,
+                )
             if torch.isnan(features).any() or torch.isnan(loss).any():
                 print(
                     f"NaN error! feat% {torch.isnan(features).sum() / (features.shape[0] * features.shape[1]):.3f}, "
@@ -80,7 +106,7 @@ def train(
                 )
                 exit(3)
 
-    return losses
+    return losses, cne_losses, reg_losses
 
 
 class ContrastiveEmbedding(object):
@@ -99,7 +125,6 @@ class ContrastiveEmbedding(object):
         lr_min_factor=0.0,
         momentum=0.0,
         temperature=0.5,
-        learn_temp=False,
         noise_in_estimator=None,
         neg_spec=None,
         ince_spec=None,
@@ -126,19 +151,28 @@ class ContrastiveEmbedding(object):
         force_resample=None,
         warmup_epochs=0,
         warmup_lr=0,
-        early_exaggeration=True
+        early_exaggeration=True,
+        regularizer=False,
+        reg_embedding=None,
+        reg_lambda=1.0,
+        reg_scaling = None,
+        alpha_init=1.0,
+        reg_pca_force = 'both',
+        decoder=False,
+        orth_reg = False,
+        lr_decoder=None,
+        lr_embd=None,
     ):
         """
         :param model: torch.nn.Module Embedding model (embedding layer for non-parametric, neural network for parametric)
         :param batch_size: int Batch size
-        :param negative_samples: int or str Number of negative samples per positive sample. If -1 or greater than 2*batch_size-2 or 'full-batch', then the whole batch is used as negative samples (i.e. 2*batch_size-2 negative samples). Note that -1 can lead to high vram usage if batch size is also high. For about 10GB set batch_size <= 2**13 for negative_samples=-1.
+        :param negative_samples: int Number of negative samples per positive sample
         :param n_epochs: int Number of optimization epochs
         :param device: torch.device or "auto" Device of optimization. If auto, cuda is used if available.
         :param learning_rate: float Learning rate
         :param lr_min_factor: float Minimal value to which learning rate is annealed
         :param momentum: float Momentum of SGD
         :param temperature: float Temperature used in Cosine similarity
-        :param learn_temp: bool Whether to learn the temperature. If True, the value for temperature is used as initial value.
         :param noise_in_estimator: float Value used in negative sampling's fraction q / (q+ noise_in_estimator), redundant with Z_bar. Deprecated, use neg_spec instead.
         :param neg_spec: float Value used in negative sampling's fraction q / (q+ neg_spec). Controls the point on the negative sampling spectrum. Redundant with Z_bar, which has priority.
         :param ince_spec: float The repulsive term in the InfoNCE loss is multiplied by the inverse of ince_spec. Controls the InfoNCE spectrum. Redundant with s, which has priority.
@@ -169,26 +203,7 @@ class ContrastiveEmbedding(object):
         """
         self.model: torch.nn.Module = model
         self.batch_size: int = batch_size
-        self.negative_samples = negative_samples
-        if isinstance(self.negative_samples, str):
-            if self.negative_samples == "full-batch":
-                self.negative_samples = 2 * self.batch_size - 2
-            else:
-                raise ValueError(
-                    f"negative_samples must be an int >=-1 or 'full-batch', but is {self.negative_samples}"
-                )
-        elif isinstance(self.negative_samples, int):
-            if self.negative_samples == -1:
-                self.negative_samples = 2 * self.batch_size - 2
-            else:
-                assert self.negative_samples >= 0, f"negative_samples must be an int >= -1 or 'full-batch' but is {self.negative_samples}"
-        else:
-            raise ValueError(
-                f"negative_samples must be an int >= -1 or 'full-batch', but is {self.negative_samples}"
-            )
-
-
-
+        self.negative_samples: int = negative_samples
         self.n_epochs: int = n_epochs
 
 
@@ -201,12 +216,7 @@ class ContrastiveEmbedding(object):
         self.device = device
         self.learning_rate = learning_rate
         self.momentum = momentum
-        self.temperature = torch.tensor(temperature, device=self.device)
-        self.learn_temp = learn_temp
-        self.log_temp = None
-        if self.learn_temp:
-            self.log_temp = torch.tensor(np.log(temperature), device=self.device)
-            self.log_temp = torch.nn.Parameter(self.log_temp, requires_grad=True)
+        self.temperature = temperature
         self.loss_mode: str = loss_mode
         self.metric: str = metric
         self.optimizer = optimizer
@@ -224,7 +234,7 @@ class ContrastiveEmbedding(object):
         self.callback = callback
 
         if print_freq_epoch == "auto":
-            self.print_freq_epoch = np.maximum(self.n_epochs // 5, 1)
+            self.print_freq_epoch = self.n_epochs // 5
         else:
             self.print_freq_epoch = print_freq_epoch
         self.print_freq_iteration = print_freq_iteration
@@ -303,10 +313,33 @@ class ContrastiveEmbedding(object):
             if (self.loss_mode not in  ["infonce", "neg"]):
                 print("Warning: Early exaggeration is only supported for loss modes 'infonce' and 'neg'.")
 
+        self.regularizer = regularizer
+        self.reg_embedding = reg_embedding
+        self.reg_lambda = reg_lambda
+        self.reg_scaling = reg_scaling
+        self.reg_pca_force = reg_pca_force
+
+        if self.reg_scaling == 'alpha':
+            self.log_alpha = torch.tensor(np.log(alpha_init), device=self.device)
+            self.log_alpha = torch.nn.Parameter(self.log_alpha, requires_grad=True)
+        else:
+            if self.reg_scaling not in ('norm', 'mean_var') and self.regularizer:
+                print('No scaling for embedding in regularization term applied.')
+            self.log_alpha = None
+
+        self.decoder = decoder
+        self.orth_reg = orth_reg
+
+        self.lr_decoder = lr_decoder if lr_decoder is not None else learning_rate
+        self.lr_embd = lr_embd if lr_embd is not None else learning_rate
+
         # move to correct device at init, esp before registering with the optimizer
         self.model = self.model.to(self.device)
 
     def process_spec_param(self, n=None, X=None, s=None, Z_bar=None, neg_spec=None, ince_spec=None, overwrite=False):
+        """
+        Process/compute parameters for loss.
+        """
         s = self.s if s is None else s
         Z_bar = self.Z_bar if Z_bar is None else Z_bar
         neg_spec = self.neg_spec if neg_spec is None else neg_spec
@@ -327,7 +360,7 @@ class ContrastiveEmbedding(object):
 
             if Z_bar is not None:
                 # assume uniform noise distribution over n**2 many edges
-                neg_spec = self.negative_samples * Z_bar / n ** 2
+                neg_spec = self.negative_samples * Z_bar / n ** 2 # used for scaling negative samples
 
             if neg_spec is not None:
                 spec_param = neg_spec
@@ -336,7 +369,7 @@ class ContrastiveEmbedding(object):
             if s is not None:
                 # overwrite self.spec_param, which will be passed to the loss
                 # s=0 --> tsne (self.ince_param=1), s=1 --> umap-like (self.ince_param=4); logarithmic interpolation
-                ince_spec = np.exp(s * np.log(4.0))
+                ince_spec = np.exp(s * np.log(12.0))
 
             # for passing to the loss
             if ince_spec is not None:
@@ -356,28 +389,55 @@ class ContrastiveEmbedding(object):
         Set up the optimizer
         :return
         """
-        params = [{"params": self.model.parameters()}]
+        params = [{"params": [p for p in self.model.parameters() if p.requires_grad]}]
+
+        # add alpha (scaling param for regularization) 
+        if self.reg_scaling == 'alpha':
+            params += [{"params": self.log_alpha, "lr": 0.001}] 
+
         if self.loss_mode == "nce":
             params += [
                 {"params": self.log_Z, "lr": 0.001}
             ]  # make sure log_Z always has a sufficiently small lr
-        if self.learn_temp:
-            params += [
-                {"params": self.log_temp, "lr": 0.001} # choose same small lr as for log_Z
-            ]
+
+
         if self.optimizer == "sgd":
-            optimizer = torch.optim.SGD(
-                params,
-                lr=self.learning_rate,
-                momentum=self.momentum,
-                weight_decay=self.weight_decay,
-            )
+            if self.decoder:
+                optimizer = torch.optim.SGD(
+                    [{'params': self.model.decoder.parameters(), 
+                      'weight_decay': self.weight_decay, 
+                      'lr': self.lr_decoder, 
+                      'name': 'decoder'
+                    },  
+                    {'params': [self.model.emb], 
+                     'weight_decay': 0.0,
+                     'lr': self.lr_embd,
+                     'name': 'embedding'
+                    }],  # no weight decay for embedding], 
+                    lr=self.learning_rate, 
+                    momentum=self.momentum
+                )
+            else:
+                optimizer = torch.optim.SGD(
+                    params,
+                    lr=self.learning_rate,
+                    momentum=self.momentum,
+                    weight_decay=self.weight_decay,
+                )
         elif self.optimizer == "adam":
-            optimizer = torch.optim.Adam(
-                params,
-                weight_decay=self.weight_decay,
-                lr=self.learning_rate,
-            )
+            if self.decoder:
+                optimizer = torch.optim.Adam([
+                        {'params': self.model.decoder.parameters(), 'weight_decay': self.weight_decay},  # weight decay for decoder
+                        {'params': [self.model.emb], 'weight_decay': 0.0},  # no weight decay for embedding
+                    ], 
+                    lr=self.learning_rate
+                )
+            else:
+                optimizer = torch.optim.Adam(
+                    params,
+                    weight_decay=self.weight_decay,
+                    lr=self.learning_rate,
+                )
         else:
             raise ValueError(
                 f"Only optimizer 'adam' and 'sgd' allowed, but is {self.optimizer}."
@@ -397,7 +457,7 @@ class ContrastiveEmbedding(object):
         self.process_spec_param(n=n, X=X, overwrite=True)
 
         # set up loss
-        criterion = ContrastiveLoss(
+        criterion_emb = ContrastiveLoss(
             negative_samples=self.negative_samples,
             metric=self.metric,
             temperature=self.temperature,
@@ -409,6 +469,19 @@ class ContrastiveEmbedding(object):
             seed=self.seed,
             loss_aggregation=self.loss_aggregation,
         )
+
+        # criterion regularization
+        if self.regularizer:
+            if self.reg_embedding is None:
+                print("Warning: Regularizer is set to True, but no embedding is provided.")
+            criterion_reg = PCARegularizer(pca_emb=torch.tensor(self.reg_embedding).to(self.device), reg_scaling=self.reg_scaling, reg_pca_force=self.reg_pca_force) 
+            criterion = CombinedLoss(contrastive_loss=criterion_emb, reg_loss=criterion_reg, rec_loss=None, reg_lambda=self.reg_lambda, regularizer=self.regularizer, decoder=self.decoder)
+        elif self.decoder:
+            criterion_rec = ReconstroctionLoss(self.model, self.orth_reg)
+            criterion = CombinedLoss(contrastive_loss=criterion_emb, reg_loss=criterion_rec, rec_loss=criterion_rec, reg_lambda=self.reg_lambda, regularizer=self.regularizer, decoder=self.decoder)
+        else:
+            criterion = CombinedLoss(contrastive_loss=criterion_emb, reg_loss=None, rec_loss=None, reg_lambda=None, regularizer=self.regularizer, decoder=self.decoder)
+
 
         # set up optimizer
         optimizer = self.setup_optimizer()
@@ -425,11 +498,12 @@ class ContrastiveEmbedding(object):
                 self.negative_samples,
                 self.loss_mode,
                 self.log_Z,
-                self.log_temp,
                 self.neg_spec
             )
 
         batch_losses = []
+        batch_losses_cne = []
+        batch_losses_reg = []
 
         # logging memory usage
         mem_dict = {
@@ -451,10 +525,11 @@ class ContrastiveEmbedding(object):
 
             # select the correctly exaggerated spectrum parameter for this epoch
             if self.early_exaggeration and self.s is not None and epoch < self.n_epochs // 3:
+                #print('test 1')
                 cur_spec_param = spec_param_early
             else:
                 cur_spec_param = self.spec_param
-
+            #print(cur_spec_param)
             # update the spec param in the loss
             criterion.spec_param = torch.tensor(cur_spec_param).to(self.device)
 
@@ -463,35 +538,74 @@ class ContrastiveEmbedding(object):
             #    optimizer = self.setup_optimizer()
 
             # anneal learning rate
-            lr = new_lr(
-                self.learning_rate,
-                self.anneal_lr,
-                self.lr_decay_rate,
-                lr_min_factor=self.lr_min_factor,
-                cur_epoch=epoch,
-                total_epochs=self.n_epochs,
-                decay_epochs=self.lr_decay_epochs,
-                warmup_epochs=self.warmup_epochs,
-                warmup_lr=self.warmup_lr,
-            )
+            if self.decoder:
+                lr_decoder = new_lr(
+                    learning_rate=self.lr_decoder,
+                    anneal_lr=self.anneal_lr,
+                    lr_decay_rate=self.lr_decay_rate,
+                    lr_min_factor=self.lr_min_factor,
+                    cur_epoch=epoch,
+                    total_epochs=self.n_epochs,
+                    decay_epochs=self.lr_decay_epochs,
+                    warmup_epochs=self.warmup_epochs,
+                    warmup_lr=self.warmup_lr,
+                )
+                lr_embd = new_lr(
+                    learning_rate=self.lr_embd,
+                    anneal_lr=self.anneal_lr,
+                    lr_decay_rate=self.lr_decay_rate,
+                    lr_min_factor=self.lr_min_factor,
+                    cur_epoch=epoch,
+                    total_epochs=self.n_epochs,
+                    decay_epochs=self.lr_decay_epochs,
+                    warmup_epochs=self.warmup_epochs,
+                    warmup_lr=self.warmup_lr,
+                )
+            else:
+                lr = new_lr(
+                    self.learning_rate,
+                    self.anneal_lr,
+                    self.lr_decay_rate,
+                    lr_min_factor=self.lr_min_factor,
+                    cur_epoch=epoch,
+                    total_epochs=self.n_epochs,
+                    decay_epochs=self.lr_decay_epochs,
+                    warmup_epochs=self.warmup_epochs,
+                    warmup_lr=self.warmup_lr,
+                )
+                
 
-            # just change the lr of the first param group, not that of Z
-            optimizer.param_groups[0]["lr"] = lr
+            # # just change the lr of the first param group, not that of Z
+            #optimizer.param_groups[0]["lr"] = lr
+
+            if self.decoder:
+                for param_group in optimizer.param_groups:
+                    if param_group['name'] == 'decoder':
+                        param_group["lr"] = 10 * lr_decoder / self.batch_size
+                    elif param_group['name'] == 'embedding':
+                        param_group["lr"] = lr_embd
+            else:
+                optimizer.param_groups[0]["lr"] = lr
 
             # train for one epoch
-            bl = train(
+            bl, bl_cne, bl_reg = train(
                 X,
                 self.model,
                 self.log_Z,
-                self.log_temp,
+                self.log_alpha,
                 criterion,
                 optimizer,
                 epoch,
+                decoder=self.decoder,
+                regularizer=self.regularizer,
                 clip_grad=self.clip_grad,
                 print_freq=self.print_freq_iteration,
                 force_resample=self.force_resample,
             )
             batch_losses.append(bl)
+            if self.regularizer or self.decoder:
+                batch_losses_cne.append(bl_cne)
+                batch_losses_reg.append(bl_reg)
 
             # callback
             if (
@@ -501,13 +615,15 @@ class ContrastiveEmbedding(object):
                 and callable(self.callback)
             ):
                 self.callback(
-                    epoch, self.model, self.negative_samples, self.loss_mode, self.log_Z, self.log_temp, self.neg_spec
+                    epoch, self.model, self.negative_samples, self.loss_mode, self.log_Z, self.neg_spec
                 )
             # print epoch progress
             if self.print_freq_epoch is not None and epoch % self.print_freq_epoch == 0:
                 print(f"Finished epoch {epoch}/{self.n_epochs}, loss {sum(bl)/ len(bl):.3f}", file=sys.stderr)
 
         self.losses = batch_losses
+        self.losses_cne = batch_losses_cne
+        self.losses_reg = batch_losses_reg
         self.mem_dict = mem_dict
         self.embedding_ = None
         return self
@@ -515,7 +631,57 @@ class ContrastiveEmbedding(object):
     def fit_transform(self, X):
         self.fit(X)
         return self.embedding_
+    
+    def return_losses(self):
+        return self.losses
+    
+    def print_params(self):
+        print(f'Alpha: {self.alpha.item()}')
 
+        for name, param in self.model.named_parameters():
+            print(f"Parameter name: {name}, Value: {param}") 
+    
+
+class PCARegularizer(torch.nn.Module):
+    """Regularizer that penalize deviations from PCA embedding"""
+
+    def __init__(
+        self,
+        pca_emb,
+        reg_scaling=None,
+        reg_pca_force = 'both',
+    ):
+        super(PCARegularizer, self).__init__()
+        self.pca_emb = pca_emb
+        self.reg_scaling = reg_scaling
+        self.reg_pca_force = reg_pca_force
+
+    def forward(self, feature, item, neigh, log_alpha=None):
+        # get pca embedding
+        batch_idx = torch.cat([item, neigh], dim=0)
+
+        if self.reg_pca_force == 'both':
+            emb = self.pca_emb[batch_idx]
+        elif self.reg_pca_force == 'item':
+            emb = self.pca_emb[item]
+            feature = feature[:len(item)]
+
+        if self.reg_scaling == 'alpha':
+            emb = torch.exp(log_alpha) * emb
+
+        elif self.reg_scaling == 'norm':
+            emb = emb * torch.norm(feature) / torch.norm(emb)
+        
+        elif self.reg_scaling == 'mean_var':
+            emb_mean = emb.mean(dim=0)
+            emb_std = emb.std(dim=0)
+            feature_mean = feature.mean(dim=0)
+            feature_std = feature.std(dim=0)
+            emb = (emb - emb_mean) / emb_std * feature_std + feature_mean
+
+        # compute loss
+        reg = torch.nn.functional.mse_loss(emb, feature, reduction='sum')
+        return reg        
 
 class ContrastiveLoss(torch.nn.Module):
     """Supervised Contrastive Learning: https://arxiv.org/pdf/2004.11362.pdf.
@@ -524,9 +690,9 @@ class ContrastiveLoss(torch.nn.Module):
     def __init__(
         self,
         negative_samples=5,
+        temperature=0.07,
         loss_mode="all",
         metric="euclidean",
-        temperature=0.05,
         base_temperature=1,
         eps=1.0,
         spec_param=1.0,
@@ -537,9 +703,9 @@ class ContrastiveLoss(torch.nn.Module):
     ):
         super(ContrastiveLoss, self).__init__()
         self.negative_samples = negative_samples
+        self.temperature = temperature
         self.loss_mode = loss_mode
         self.metric = metric
-        self.temperature = temperature
         self.base_temperature = base_temperature
         self.spec_param = spec_param
         self.eps = eps
@@ -550,7 +716,7 @@ class ContrastiveLoss(torch.nn.Module):
         self.neigh_inds = None
         self.loss_aggregation = loss_aggregation
 
-    def forward(self, features, log_Z=None, log_temp=None, force_resample=False):
+    def forward(self, features, log_Z=None, force_resample=False):
         """Compute loss for model. SimCLR unsupervised loss:
         https://arxiv.org/pdf/2002.05709.pdf
 
@@ -565,69 +731,49 @@ class ContrastiveLoss(torch.nn.Module):
         batch_size = features.shape[0] // 2
         b = batch_size
 
-        # use the learnable temperature if not None
-        temperature = torch.exp(log_temp) if log_temp is not None else self.temperature
-
         # We can at most sample this many samples from the batch.
         # `b` can be lower than `self.negative_samples` in the last batch.
-        negative_samples = min(self.negative_samples, 2 * b - 2)
+        negative_samples = min(self.negative_samples, 2 * b - 1)
 
         if force_resample or self.neigh_inds is None:
             neigh_inds = make_neighbor_indices(
                 batch_size, negative_samples, device=features.device
             )
             self.neigh_inds = neigh_inds
+        # # untested logic to accomodate for last batch
+        # elif self.neigh_inds.shape[0] != batch_size:
+        #     neigh_inds = make_neighbor_indices(batch_size, negative_samples)
+        #     # don't save this one
         else:
             neigh_inds = self.neigh_inds
+        neighbors = features[neigh_inds]
 
         # `neigh_mask` indicates which samples feel attractive force
         # and which ones repel each other
         neigh_mask = torch.ones_like(neigh_inds, dtype=torch.bool)
-        neigh_mask[:, 0] = False
+        neigh_mask[:, 0] = False # first column are the positive samples
 
-        origs = features[:b]
+        origs = features[:b] #original data points (positive samples)
 
-        if negative_samples * features.shape[1] < b:
-            # peak memormy usage b*negative_sapmles*features.shape[1]
+        # compute probits
+        if self.metric == "euclidean":
+            dists = ((origs[:, None] - neighbors) ** 2).sum(axis=2)
+            # Cauchy affinities
+            probits = torch.div(1, self.eps + dists)
+            # neighbor_weight = torch.exp(-dists / dists.median())  # Gaussian-like weighting
+            # probits *= neighbor_weight
 
-            neighbors = features[neigh_inds]
-
-            # compute probits
-            if self.metric == "euclidean":
-                sq_dists = ((origs[:, None] - neighbors) ** 2).sum(axis=2)
-                # Cauchy affinities
-                probits = torch.div(1, self.eps + sq_dists)
-            elif self.metric == "cosine":
-                norm = torch.nn.functional.normalize
-                o = norm(origs.unsqueeze(1), dim=2)
-                n = norm(neighbors.transpose(1, 2), dim=1)
-                logits = torch.bmm(o, n).squeeze() / temperature.clamp(0.02, None)  # bound temp from below to avoid overflow
-                probits = torch.exp(logits)
-            else:
-                raise ValueError(f"Unknown metric “{self.metric}”")
-
+        elif self.metric == "cosine":
+            norm = torch.nn.functional.normalize
+            o = norm(origs.unsqueeze(1), dim=2)
+            n = norm(neighbors.transpose(1, 2), dim=1)
+            logits = torch.bmm(o, n).squeeze() / self.temperature
+            # logits_max, _ = logits.max(dim=1, keepdim=True)
+            # logits -= logits_max.detach()
+            # logits -= logits.max().detach()
+            probits = torch.exp(logits)
         else:
-            # peak memory usage b*b
-            # compute all interactions first
-
-            batch_indices = torch.arange(b, device=features.device).unsqueeze(1).expand(-1, negative_samples+1) # +1 because of positive tail
-
-            if self.metric == "euclidean":
-                all_sq_dists = ((features[:, None] - features) ** 2).sum(axis=2)
-                # Cauchy affinities
-                all_probits = torch.div(1, self.eps + all_sq_dists)
-                sq_dists = all_sq_dists[batch_indices, neigh_inds]
-            elif self.metric == "cosine":
-                norm = torch.nn.functional.normalize
-                features_normed = norm(features, dim=1)
-                all_logits = torch.matmul(features_normed, features_normed.T) / temperature.clamp(0.02,
-                                                                       None)  # bound temp from below to avoid overflow
-                all_probits = torch.exp(all_logits)
-
-            else:
-                raise ValueError(f"Unknown metric “{self.metric}”")
-
-            probits = all_probits[batch_indices, neigh_inds]
+            raise ValueError(f"Unknown metric “{self.metric}”")
 
         # compute loss
         if self.loss_mode == "nce":
@@ -640,18 +786,19 @@ class ContrastiveLoss(torch.nn.Module):
                 # estimator is (cauchy / Z) / ( cauchy / Z + neg samples)). For numerical
                 # stability rewrite to 1 / ( 1 + (d**2 + eps) * Z * m)
                 estimator = 1 / (
-                    1 + (sq_dists + self.eps) * torch.exp(log_Z) * negative_samples
+                    1 + (dists + self.eps) * torch.exp(log_Z) * negative_samples
                 )
             else:
-                probits = torch.exp(probits.log()-log_Z)  # numerically stable
+                probits = probits / torch.exp(log_Z)
                 estimator = probits / (probits + negative_samples)
+
             loss = -(~neigh_mask * torch.log(estimator.clamp(self.clamp_low, self.clamp_high))) - (
                 neigh_mask * torch.log((1 - estimator).clamp(self.clamp_low, self.clamp_high))
             )
         elif self.loss_mode == "neg":
             if self.metric == "euclidean":
                 # estimator rewritten for numerical stability as for nce
-                estimator = 1 / (1 + self.spec_param * (sq_dists + self.eps))
+                estimator = 1 / (1 + self.spec_param * (dists + self.eps))
             else:
                 estimator = probits / (probits + self.spec_param)
 
@@ -687,6 +834,55 @@ class ContrastiveLoss(torch.nn.Module):
             loss = loss.mean()
 
         return loss
+    
+class ReconstroctionLoss(torch.nn.Module):
+    def __init__(self, model, orth_reg=False):
+        super(ReconstroctionLoss, self).__init__()
+        self.model = model
+        self.orth_reg = orth_reg
+
+    def forward(self, item, neigh, log_alpha=None):
+        idx = torch.cat([item, neigh], dim=0)
+        x, x_hat, emb = self.model(idx)
+        if self.orth_reg:
+            weights_dec = self.model.decoder.weight
+            identity = torch.eye(weights_dec.shape[1], device=weights_dec.device)
+            reg_loss = torch.norm(weights_dec.T @ weights_dec - identity, p='fro')
+
+            loss = torch.nn.functional.mse_loss(x_hat, x, reduction='mean') + reg_loss
+        else:
+            loss = torch.nn.functional.mse_loss(x_hat, x, reduction='sum')
+        
+        return loss
+
+
+class CombinedLoss(torch.nn.Module):
+    def __init__(self, contrastive_loss, reg_loss, rec_loss=None, reg_lambda=1.0, regularizer=False, decoder=False):
+        super(CombinedLoss, self).__init__()
+        self.contrastive_loss = contrastive_loss
+        self.reg_loss = reg_loss
+        self.rec_loss = rec_loss
+        self.reg_lambda = reg_lambda
+        self.regularizer = regularizer
+        self.decoder = decoder
+
+    def forward(self, features, item, neigh, log_Z=None, log_alpha=None, force_resample=False):
+        # Compute loss
+        contrastive_loss = self.contrastive_loss(features, log_Z, force_resample)
+
+        if self.regularizer:
+            regularization_loss = self.reg_loss(features, item, neigh, log_alpha)
+            total_loss = (1-self.reg_lambda) * contrastive_loss + self.reg_lambda * regularization_loss
+            return total_loss, contrastive_loss, regularization_loss
+        
+        elif self.decoder:
+            rec_loss = self.rec_loss(item, neigh)
+            total_loss = (1-self.reg_lambda) * contrastive_loss + self.reg_lambda * rec_loss
+            return total_loss, contrastive_loss, rec_loss
+        
+        else:
+            total_loss = contrastive_loss
+            return total_loss, None, None
 
 
 def new_lr(
@@ -748,12 +944,12 @@ def make_neighbor_indices(batch_size, negative_samples, device=None):
     b = batch_size
 
     if negative_samples < 2 * b - 2:
-        # uniform probability for all points in the minibatch, save the head of the positive pair,
+        # uniform probability for all points in the minibatch,
         # we sample points for repulsion randomly
-        neg_inds = torch.randint(0, 2 * b - 1, (b, negative_samples), device=device)
-        neg_inds += (torch.arange(1, b + 1, device=device) - 2 * b)[:, None]
+        neg_inds = torch.randint(0, 2 * b - 1, (b, negative_samples), device=device) # sample indexes in [0,2*b-1] -> neg_inds -> dim b x negative_samples
+        neg_inds += (torch.arange(1, b + 1, device=device) - 2 * b)[:, None] # no self pairing
     else:
-        # full batch repulsion, all points save those of the positive pair are used as negative samples
+        # full batch repulsion
         all_inds1 = torch.repeat_interleave(
             torch.arange(b, device=device)[None, :], b, dim=0
         )
@@ -768,7 +964,7 @@ def make_neighbor_indices(batch_size, negative_samples, device=None):
 
     # now add transformed explicitly
     neigh_inds = torch.hstack(
-        (torch.arange(b, 2 * b, device=device)[:, None], neg_inds)
+        (torch.arange(b, 2 * b, device=device)[:, None], neg_inds) # dim b x (1 + negative_samples) -> first + 2nd column is positive sample
     )
 
     return neigh_inds

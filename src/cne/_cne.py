@@ -1,7 +1,7 @@
 import torch
 import numpy as np
 
-from .cne import ContrastiveEmbedding
+from cne import ContrastiveEmbedding
 from annoy import AnnoyIndex
 from scipy.sparse import lil_matrix
 from sklearn.decomposition import PCA
@@ -26,7 +26,7 @@ class NeighborTransformData(torch.utils.data.Dataset):
 
         item = self.dataset[i]
         neigh = self.dataset[nidx]
-        return item, neigh
+        return item, neigh # returns one pair of neighboring points (item = input point, neigh = neighbor point)
 
 
 class NeighborTransformIndices(torch.utils.data.Dataset):
@@ -34,16 +34,15 @@ class NeighborTransformIndices(torch.utils.data.Dataset):
     def __init__(
             self, neighbor_mat, random_state=None
     ):
-        neighbor_mat = neighbor_mat.tocoo()
-        self.heads = torch.tensor(neighbor_mat.row)
-        self.tails = torch.tensor(neighbor_mat.col)
+        neighbor_mat = neighbor_mat.tocoo() # convert to COO format 
+        self.heads = torch.tensor(neighbor_mat.row) # row indices of all non-zero entries
+        self.tails = torch.tensor(neighbor_mat.col) # col indices of all non-zero entries
 
     def __len__(self):
-        return len(self.heads)
+        return len(self.heads) # number of nonzero elements/neighbors
 
     def __getitem__(self, i):
-        return self.heads[i], self.tails[i]
-
+        return self.heads[i], self.tails[i] # returns one pair of indices of neighboring points
 
 
 class NumpyToTensorDataset(torch.utils.data.Dataset):
@@ -169,6 +168,43 @@ class FCNetwork(torch.nn.Module):
         logits = self.linear_relu_stack(x)
         return logits
 
+class Lin_Decoder(torch.nn.Module):
+    '''
+    Decoder with Linear layers; optimizes embedding.
+    '''
+    def __init__(self, X, n, n_features, emb_dim, init=None, init_weights=None):
+        super().__init__()
+
+        self.embd_layer = torch.nn.Embedding.from_pretrained(torch.tensor(X).to(torch.float32), freeze=True) # idx to original data point
+
+        if init is None:
+            print("Initializing embedding with PCA.")
+            pca_projector = PCA(n_components=emb_dim)
+            init = pca_projector.fit_transform(X)
+            init /= (init[:, 0].std())
+            self.emb = torch.nn.Parameter(torch.tensor(init, dtype=torch.float32))
+        else:
+            print("Using provided initialization.")
+            self.emb = torch.nn.Parameter(torch.tensor(init, dtype=torch.float32))
+    
+        self.decoder = torch.nn.Linear(emb_dim, n_features, bias=True)
+        if init_weights is not None:
+            print("Using provided initialization for decoder weights.")
+            with torch.no_grad():
+                self.decoder.weight.data.copy_(torch.tensor(init_weights, dtype=torch.float32))
+                self.decoder.bias.data.copy_(torch.zeros(n_features))
+        else:
+            print("Initializing decoder weights randomly.")
+
+
+        
+    def forward(self, idx): 
+        x = self.embd_layer(idx) # richtig? oder muss idx 1-hot-encoded vector sein?
+        emb = self.emb[idx]
+        x_hat = self.decoder(emb)
+
+        return x, x_hat, emb
+        #return x_hat, emb
 
 class CNE(object):
     """
@@ -178,6 +214,7 @@ class CNE(object):
                  model=None,
                  k=15,
                  parametric=False,
+                 decoder=False,
                  data_on_gpu="auto",
                  use_keops=None,
                  seed=0,
@@ -198,6 +235,7 @@ class CNE(object):
         self.model = model
         self.k = k
         self.parametric = parametric
+        self.decoder = decoder
         self.data_on_gpu = data_on_gpu
         self.use_keops = use_keops
         self.kwargs = kwargs
@@ -206,9 +244,9 @@ class CNE(object):
         self.embd_dim = embd_dim
 
 
-    def fit_transform(self, X, init=None, graph=None):
+    def fit_transform(self, X, init=None, graph=None, init_weights=None):
         "Fit the model, then transform."
-        self.fit(X, init=init, graph=graph)
+        self.fit(X, init=init, graph=graph, init_weights=init_weights)
         return self.transform(X, fit_transform=True)
 
     def transform(self, X, fit_transform=False):
@@ -226,6 +264,11 @@ class CNE(object):
             embd = np.vstack([model(batch.to(device))
                             .detach().cpu().numpy()
                             for batch in self.dl_unshuf])
+        elif self.decoder:
+            embd = self.model.emb.detach().cpu().numpy()
+            weights_decoder = self.model.decoder.weight.detach().cpu().numpy()
+            bias_decoder = self.model.decoder.bias.detach().cpu().numpy()
+            return embd, (weights_decoder, bias_decoder)
         else:
             embd = self.model.weight.detach().cpu().numpy()
             if isinstance(X, int):
@@ -240,8 +283,11 @@ class CNE(object):
                     print("Warning: A non-parametric model cannot transform new data. Returning the embedding of the training data. "
                           "Pass an integer (or a list / np.array thereof) to obtain the corresponding training embeddings")
         return embd
+    
+    def return_losses(self):
+        return self.cne.losses, self.cne.losses_cne, self.cne.losses_reg
 
-    def fit(self, X, init=None, graph=None):
+    def fit(self, X, init=None, graph=None, init_weights=None):
         """
         Fit the model
         :param X: np.array Dataset
@@ -253,18 +299,20 @@ class CNE(object):
         :return:
         """
         start_time = time.time()
-        X = X.reshape(X.shape[0], -1)
+        X = X.reshape(X.shape[0], -1) # reshape to 2D (n_samples, n_features)
         in_dim = X.shape[1]
         # set up model if not given
         if self.model is None:
             if self.parametric:
                 self.embd_layer = torch.nn.Embedding.from_pretrained(torch.tensor(X).to(torch.float32),
-                                                                     freeze=True)
-                self.network = FCNetwork(in_dim, feat_dim=self.embd_dim)
+                                                                     freeze=True) # lookup table, transforms index to tensor (equivalent to one-hot encoding with rows of X as weights)
+                self.network = FCNetwork(in_dim, feat_dim=self.embd_dim) 
                 self.model = torch.nn.Sequential(
                     self.embd_layer,
                     self.network
                 )
+            elif self.decoder:
+                self.model = Lin_Decoder(X, X.shape[0], in_dim, self.embd_dim, init, init_weights)
             else:
                 if init is None:
                     # default to pca
@@ -283,6 +331,9 @@ class CNE(object):
                 self.model = torch.nn.Embedding.from_pretrained(torch.tensor(init))
                 self.model.requires_grad_(True)
 
+            # parametric: trainable network (extra linear layer, freezed embedding layer) 
+            # non-parametric: directly learns embedding through embedding layer
+
         # use higher learning rate for non-parametric version
         if "learning_rate" not in self.kwargs.keys():
             lr = 0.001 if self.parametric else 1.0
@@ -292,8 +343,10 @@ class CNE(object):
         self.cne = ContrastiveEmbedding(self.model,
                                         seed=self.seed,
                                         anneal_lr=self.anneal_lr,
+                                        decoder=self.decoder,
                                         **self.kwargs)
 
+        
         # is no graph is passed, compute the similarity graph with pykeops is cuda is available and otherwise annoy
         if graph is None:
             # select annoy or pykeops depending on data_on_gpu and availability of pykeops
