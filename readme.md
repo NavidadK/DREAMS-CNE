@@ -12,7 +12,7 @@ This code builds upon [Contrastive Neighbor Embeddings](https://github.com/beren
 # Installation
 To use the method you must follow these steps:
 ````
-git clone --branch tp --single-branch https://github.com/NavidadK/DREAMS-CNE
+git clone --branch tp --single-branch https://github.com/berenslab/DREAMS-CNE
 cd DREAMS-CNE
 pip install .
 ````
