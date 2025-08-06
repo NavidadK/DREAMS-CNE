@@ -1,4 +1,4 @@
-Copyright (c) 2025 Noël Kury and Sebastian Damrich
+Copyright 2022 Berens Lab - Data Science for Vision Research at the Institute for Ophthalmic Research, University of Tübingen, and Interdisciplinary Center for Scientific Computing, Heidelberg University
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
@@ -16,6 +16,3 @@ FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
 COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
 IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
 CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
-
-This project is based on the contrastive-ne library by the Berens Lab and the Interdisciplinary Center for Scientific Computing, Heidelberg University, licensed under the MIT License.
-The original license is available in the file LICENSE-CNE.
