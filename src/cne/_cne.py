@@ -195,16 +195,14 @@ class Lin_Decoder(torch.nn.Module):
                 self.decoder.bias.data.copy_(torch.zeros(n_features))
         else:
             print("Initializing decoder weights randomly.")
-
-
         
     def forward(self, idx): 
-        x = self.embd_layer(idx) # richtig? oder muss idx 1-hot-encoded vector sein?
+        x = self.embd_layer(idx) 
         emb = self.emb[idx]
         x_hat = self.decoder(emb)
 
         return x, x_hat, emb
-        #return x_hat, emb
+
 
 class CNE(object):
     """
@@ -226,6 +224,7 @@ class CNE(object):
         :param k: int Number of nearest neighbors
         :param parametric: bool If True and model=None uses a parametric embedding model
         :param data_on_gpu: bool or "auto" Load whole dataset to GPU and try to use pykeops for kNN graph if possible.
+        :param decoder: bool If true use linear decoding regularizer.
         :param use_keops: bool If True use pykeops for kNN graph computation. If False use annoy. Supercedes the kNN
         graph selection by data_on_gpu if not None.
         :param seed: int Random seed

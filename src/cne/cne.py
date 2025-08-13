@@ -27,6 +27,8 @@ def train(
     :param criterion: torch.nn.Module Computes the loss
     :param optimizer:  torch.optim.Optimizer
     :param epoch: int Current training epoch
+    :param decoder: bool If True, uses linear decoding regularization
+    :param regularizer: bool If True, uses regularization
     :param clip_grad: bool If True, clips gradients to 4
     :param print_freq: int or None Frequency for printing if not None
     :param force_resample: bool or None If True, forces resampling of negative sample indices for every batch. If None, once every epoch.
@@ -36,7 +38,6 @@ def train(
     losses = []
     cne_losses = []
     reg_losses = []
-    # pcgrad = PCGrad(optimizer)
 
     for idx, (item, neigh) in enumerate(train_loader):
         print_now = print_freq is not None and (idx + 1) % print_freq == 0
@@ -54,8 +55,7 @@ def train(
         if print_now:
             features.retain_grad()  # to print model agnostic grad statistics
         force_resample = force_resample if force_resample is not None else idx == 0
-        loss, cne_loss, reg_loss = criterion(features, item, neigh, log_Z, log_alpha, force_resample) # force_resample=force_resample # hier mit regularizer (nur ein criterion/loss) -> item, neigh als zstlz. input
-
+        loss, cne_loss, reg_loss = criterion(features, item, neigh, log_Z, log_alpha, force_resample)
         # update metric
         losses.append(loss.item())
         if regularizer or decoder:
@@ -65,9 +65,7 @@ def train(
         # Update parameters
         optimizer.zero_grad()
         loss.backward()
-        if epoch % 20 == 0 and idx == 0:
-            if log_alpha is not None:
-                print(f'alpha: {np.exp(log_alpha.item())} - grad log_alpha {log_alpha.grad.item()}')
+
         if clip_grad:
             torch.nn.utils.clip_grad_value_(model.parameters(), 4)
             if log_Z is not None:
@@ -153,12 +151,12 @@ class ContrastiveEmbedding(object):
         warmup_lr=0,
         early_exaggeration=True,
         regularizer=False,
+        decoder=False,
         reg_embedding=None,
-        reg_lambda=1.0,
-        reg_scaling = None,
+        reg_lambda=None,
+        reg_scaling = 'norm',
         alpha_init=1.0,
         reg_pca_force = 'both',
-        decoder=False,
         orth_reg = False,
         lr_decoder=None,
         lr_embd=None,
@@ -200,6 +198,16 @@ class ContrastiveEmbedding(object):
         :param warmup_epochs: int Number of epochs for linearly warming up the learning rate
         :param warmup_lr: float Starting learning rate to warm up from.
         :param early_exaggeration: bool Whether to use the first third of the optimization in the s=1 regime. Only affects loss modes "infonce" and "neg".
+        :param regularizer: bool whether regularizer for global structure preservation is used.
+        :param decoder: bool whether to use linear decoding regularization.
+        :param reg_embedding: np.array Global embedding that is used for regularization.
+        :param reg_lambda: float Regularization strength.
+        :param reg_scaling: float Scaling of regularization-embedding. Must be 'norm', 'mean_var', 'alpha'(learnable alpha) or 'None'
+        :param alpha_init: float Initial value for alpha (used for linear decoding regularization with learnable alpha)
+        :param reg_pca_force: str Specifies if regularization is all samples or only positive samples. Must be 'both' (positive and negative), or 'item' (only positive).
+        :param orth_reg: bool Whether to use orthogonal regularization.
+        :param lr_decoder: float Learning rate for the decoder (per default same as learning_rate).
+        :param lr_embd: float Learning rate for the embedding (per default same as learning_rate).
         """
         self.model: torch.nn.Module = model
         self.batch_size: int = batch_size
@@ -313,9 +321,9 @@ class ContrastiveEmbedding(object):
             if (self.loss_mode not in  ["infonce", "neg"]):
                 print("Warning: Early exaggeration is only supported for loss modes 'infonce' and 'neg'.")
 
+        # Regularization parameter
         self.regularizer = regularizer
         self.reg_embedding = reg_embedding
-        self.reg_lambda = reg_lambda
         self.reg_scaling = reg_scaling
         self.reg_pca_force = reg_pca_force
 
@@ -329,6 +337,15 @@ class ContrastiveEmbedding(object):
 
         self.decoder = decoder
         self.orth_reg = orth_reg
+
+        if self.regularizer:
+            if self.reg_lambda is None:
+                if self.decoder:
+                    self.reg_lambda = 0.01
+                else:
+                    self.reg_lambda = 0.0005
+            else:
+                self.reg_lambda = reg_lambda
 
         self.lr_decoder = lr_decoder if lr_decoder is not None else learning_rate
         self.lr_embd = lr_embd if lr_embd is not None else learning_rate
@@ -391,7 +408,7 @@ class ContrastiveEmbedding(object):
         """
         params = [{"params": [p for p in self.model.parameters() if p.requires_grad]}]
 
-        # add alpha (scaling param for regularization) 
+        # add learnable alpha (scaling param for regularization) 
         if self.reg_scaling == 'alpha':
             params += [{"params": self.log_alpha, "lr": 0.001}] 
 
@@ -525,17 +542,11 @@ class ContrastiveEmbedding(object):
 
             # select the correctly exaggerated spectrum parameter for this epoch
             if self.early_exaggeration and self.s is not None and epoch < self.n_epochs // 3:
-                #print('test 1')
                 cur_spec_param = spec_param_early
             else:
                 cur_spec_param = self.spec_param
-            #print(cur_spec_param)
             # update the spec param in the loss
             criterion.spec_param = torch.tensor(cur_spec_param).to(self.device)
-
-            # first time after early exaggeration, reset the optimizer if it is adam
-            #if self.early_exaggeration and epoch == self.n_epochs // 3 and self.optimizer == "adam":
-            #    optimizer = self.setup_optimizer()
 
             # anneal learning rate
             if self.decoder:
@@ -573,10 +584,6 @@ class ContrastiveEmbedding(object):
                     warmup_epochs=self.warmup_epochs,
                     warmup_lr=self.warmup_lr,
                 )
-                
-
-            # # just change the lr of the first param group, not that of Z
-            #optimizer.param_groups[0]["lr"] = lr
 
             if self.decoder:
                 for param_group in optimizer.param_groups:
@@ -659,13 +666,13 @@ class PCARegularizer(torch.nn.Module):
     def forward(self, feature, item, neigh, log_alpha=None):
         # get pca embedding
         batch_idx = torch.cat([item, neigh], dim=0)
-
         if self.reg_pca_force == 'both':
             emb = self.pca_emb[batch_idx]
         elif self.reg_pca_force == 'item':
             emb = self.pca_emb[item]
             feature = feature[:len(item)]
-
+        
+        # Compute scaled regularization embedding
         if self.reg_scaling == 'alpha':
             emb = torch.exp(log_alpha) * emb
 
@@ -882,7 +889,7 @@ class CombinedLoss(torch.nn.Module):
         
         else:
             total_loss = contrastive_loss
-            return total_loss, None, None
+            return total_loss, contrastive_loss, None
 
 
 def new_lr(
