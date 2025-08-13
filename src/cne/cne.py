@@ -337,6 +337,7 @@ class ContrastiveEmbedding(object):
 
         self.decoder = decoder
         self.orth_reg = orth_reg
+        self.reg_lambda = reg_lambda
 
         if self.regularizer:
             if self.reg_lambda is None:
