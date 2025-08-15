@@ -153,7 +153,7 @@ class ContrastiveEmbedding(object):
         regularizer=False,
         decoder=False,
         reg_embedding=None,
-        reg_lambda=None,
+        reg_lambda=0.001,
         reg_scaling = 'norm',
         alpha_init=1.0,
         reg_pca_force = 'both',
@@ -337,17 +337,9 @@ class ContrastiveEmbedding(object):
 
         self.decoder = decoder
         self.orth_reg = orth_reg
+
         self.reg_lambda = reg_lambda
-
-        if self.regularizer:
-            if self.reg_lambda is None:
-                if self.decoder:
-                    self.reg_lambda = 0.01
-                else:
-                    self.reg_lambda = 0.0005
-            else:
-                self.reg_lambda = reg_lambda
-
+  
         self.lr_decoder = lr_decoder if lr_decoder is not None else learning_rate
         self.lr_embd = lr_embd if lr_embd is not None else learning_rate
 
