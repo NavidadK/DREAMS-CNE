@@ -31,11 +31,11 @@ from sklearn.decomposition import PCA
 tasic_data = np.load('data/tasic/tasic-pca50.npy')
 # Scaled first 2 PCs
 tasic_pca2 = tasic_data[:, :2]
-tasic_reg_emb = tasic_pca2 / tasic_pca2[:,0].std()
+tasic_reg_emb = tasic_pca2 / tasic_pca2[:,0].std() * 0.0001
 # Initial decoder weights
 pca = PCA(n_components=2)
 tasic_pca2_sk = pca.fit_transform(tasic_data)
-tasic_init_weights = pca.components_.T /  tasic_pca2_sk[:,0].std()
+tasic_init_weights = pca.components_.T /  tasic_pca2_sk[:,0].std() * 0.0001
 
 # DREAMS-CNE
  embedder_cne = cne.CNE(negative_samples=500,
@@ -46,7 +46,7 @@ tasic_init_weights = pca.components_.T /  tasic_pca2_sk[:,0].std()
                         reg_scaling='norm')
 embd_cne = embedder_cne.fit_transform(data)
 
-# DREAMS-CNE
+# DREAMS-CNE-Decoder
 embedder_cne_dec = cne.CNE( negative_samples=500,
                             n_epochs=750,
                             decoder=True, 
